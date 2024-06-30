@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract FuturisticPayments {
+    string public name = "FuturisticStablecoin";
+    string public symbol = "FSC";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => bool) public frozenAccount;
+    mapping(address => bool) public trustedMerchant;
+    
+    address public owner;
+    address[] public multiSigOwners;
+    uint public requiredConfirmations;
+
+    struct Transaction {
+        address to;
+        uint256 value;
+        string details;
+        bool executed;
+        uint numConfirmations;
+        mapping(address => bool) isConfirmed;
+    }
+
+    Transaction[] public transactions;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    event BillPaid(address indexed from, address indexed to, uint256 value, string billDetails);
+    event FreezeAccount(address indexed target, bool frozen);
+    event TrustedMerchant(address indexed merchant, bool trusted);
+    event SubmitTransaction(uint indexed txIndex, address indexed owner, address indexed to, uint256 value, string details);
+    event ConfirmTransaction(address indexed owner, uint indexed txIndex);
+    event ExecuteTransaction(address indexed owner, uint indexed txIndex);
+    event RevokeConfirmation(address indexed owner, uint indexed txIndex);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only the owner can perform this action");
+        _;
+    }
+    
+    modifier onlyMultiSigOwner() {
+        bool isOwner = false;
+        for (uint i = 0; i < multiSigOwners.length; i++) {
+            if (multiSigOwners[i] == msg.sender) {
+                isOwner = true;
+                break;
+            }
+        }
+        require(isOwner, "Only multi-sig owners can perform this action");
+        _;
+    }
+
+    modifier notFrozen(address _account) {
+        require(!frozenAccount[_account], "Account is frozen");
+        _;
+    }
+
+    constructor(uint256 _initialSupply, address[] memory _multiSigOwners, uint _requiredConfirmations) {
+        owner = msg.sender;
+        totalSupply = _initialSupply * (10 ** uint256(decimals));
+        balanceOf[owner] = totalSupply;
+        multiSigOwners = _multiSigOwners;
+        requiredConfirmations = _requiredConfirmations;
+    }
+
+    function transfer(address _to, uint256 _value) public notFrozen(msg.sender) notFrozen(_to) returns (bool success) {
+        require(balanceOf[msg.sender] >= _value, "Insufficient balance");
+        balanceOf[msg.sender] -= _value;
+        balanceOf[_to] += _value;
+        emit Transfer(msg.sender, _to, _value);
+        return true;
+    }
+
+    function approve(address _spender, uint256 _value) public notFrozen(msg.sender) returns (bool success) {
+        allowance[msg.sender][_spender] = _value;
+        emit Approval(msg.sender, _spender, _value);
+        return true;
+    }
+
+    function transferFrom(address _from, address _to, uint256 _value) public notFrozen(_from) notFrozen(_to) returns (bool success) {
+        require(_value <= balanceOf[_from], "Insufficient balance");
+        require(_value <= allowance[_from][msg.sender], "Allowance exceeded");
+        balanceOf[_from] -= _value;
+        balanceOf[_to] += _value;
+        allowance[_from][msg.sender] -= _value;
+        emit Transfer(_from, _to, _value);
+        return true;
+    }
+
+    function mint(address _to, uint256 _value) public onlyOwner returns (bool success) {
+        totalSupply += _value * (10 ** uint256(decimals));
+        balanceOf[_to] += _value * (10 ** uint256(decimals));
+        emit Transfer(address(0), _to, _value * (10 ** uint256(decimals)));
+        return true;
+    }
+
+    function payBill(address _to, uint256 _value, string memory billDetails) public notFrozen(msg.sender) notFrozen(_to) returns (bool success) {
+        require(balanceOf[msg.sender] >= _value, "Insufficient balance");
+        require(trustedMerchant[_to], "Recipient is not a trusted merchant");
+        balanceOf[msg.sender] -= _value;
+        balanceOf[_to] += _value;
+        emit BillPaid(msg.sender, _to, _value, billDetails);
+        return true;
+    }
+
+    function freezeAccount(address _target, bool _freeze) public onlyOwner {
+        frozenAccount[_target] = _freeze;
+        emit FreezeAccount(_target, _freeze);
+    }
+
+    function setTrustedMerchant(address _merchant, bool _trusted) public onlyOwner {
+        trustedMerchant[_merchant] = _trusted;
+        emit TrustedMerchant(_merchant, _trusted);
+    }
+
+    function submitTransaction(address _to, uint256 _value, string memory _details) public onlyMultiSigOwner {
+        uint txIndex = transactions.length;
+
+        transactions.push(Transaction({
+            to: _to,
+            value: _value,
+            details: _details,
+            executed: false,
+            numConfirmations: 0
+        }));
+
+        emit SubmitTransaction(txIndex, msg.sender, _to, _value, _details);
+    }
+
+    function confirmTransaction(uint _txIndex) public onlyMultiSigOwner {
+        Transaction storage transaction = transactions[_txIndex];
+
+        require(!transaction.executed, "Transaction already executed");
+        require(!transaction.isConfirmed[msg.sender], "Transaction already confirmed");
+
+        transaction.isConfirmed[msg.sender] = true;
+        transaction.numConfirmations += 1;
+
+        emit ConfirmTransaction(msg.sender, _txIndex);
+
+        if (transaction.numConfirmations >= requiredConfirmations) {
+            executeTransaction(_txIndex);
+        }
+    }
+
+    function executeTransaction(uint _txIndex) public onlyMultiSigOwner {
+        Transaction storage transaction = transactions[_txIndex];
+
+        require(transaction.numConfirmations >= requiredConfirmations, "Cannot execute transaction");
+        require(!transaction.executed, "Transaction already executed");
+
+        transaction.executed = true;
+        balanceOf[transaction.to] += transaction.value;
+
+        emit ExecuteTransaction(msg.sender, _txIndex);
+    }
+
+    function revokeConfirmation(uint _txIndex) public onlyMultiSigOwner {
+        Transaction storage transaction = transactions[_txIndex];
+
+        require(transaction.isConfirmed[msg.sender], "Transaction not confirmed");
+
+        transaction.isConfirmed[msg.sender] = false;
+        transaction.numConfirmations -= 1;
+
+        emit RevokeConfirmation(msg.sender, _txIndex);
+    }
+}
